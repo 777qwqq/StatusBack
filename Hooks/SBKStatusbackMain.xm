@@ -1,5 +1,3 @@
-#pragma once
-
 // StatusBack — universal "back" for iOS 16 rootless.
 //
 // Tapping the left or right half of the status bar posts a Darwin
@@ -195,8 +193,13 @@ static void sbk_statusback_HandleHomeNotification(CFNotificationCenterRef center
         homeSelector = NSSelectorFromString(@"goHome");
         if (![sb respondsToSelector:homeSelector]) return;
     }
+    NSMethodSignature *signature = [sb methodSignatureForSelector:homeSelector];
+    if (!signature) return;
+    NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+    invocation.target = sb;
+    invocation.selector = homeSelector;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [sb performSelector:homeSelector];
+        [invocation invoke];
     });
 }
 
