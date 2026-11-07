@@ -8,7 +8,7 @@
         <dict>
             <key>cell</key><string>PSGroupCell</string>
             <key>label</key><string>基本设置</string>
-            <key>footerText</key><string>点击状态栏即可返回上一级；已到根页面时按下方设置回主屏幕。</string>
+            <key>footerText</key><string>点击悬浮球即可返回上一级；已到根页面时按下方设置回主屏幕。悬浮球可拖动，位置会被记住。</string>
         </dict>
         <dict>
             <key>cell</key><string>PSSwitchCell</string>
@@ -18,23 +18,36 @@
             <key>default</key><false/>
         </dict>
         <dict>
-            <key>cell</key><string>PSSegmentCell</string>
-            <key>label</key><string>触发区域</string>
-            <key>key</key><string>triggerSide</string>
+            <key>cell</key><string>PSSwitchCell</string>
+            <key>label</key><string>显示悬浮球</string>
+            <key>key</key><string>showFloatButton</string>
             <key>defaults</key><string>com.catpaw.statusback</string>
-            <key>default</key><integer>1</integer>
-            <key>validValues</key>
-            <array>
-                <integer>1</integer>
-                <integer>2</integer>
-                <integer>3</integer>
-            </array>
-            <key>validTitles</key>
-            <array>
-                <string>左侧</string>
-                <string>右侧</string>
-                <string>整条</string>
-            </array>
+            <key>default</key><true/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSliderCell</string>
+            <key>label</key><string>不透明度</string>
+            <key>key</key><string>floatButtonAlpha</string>
+            <key>defaults</key><string>com.catpaw.statusback</string>
+            <key>default</key><real>0.85</real>
+            <key>min</key><real>0.2</real>
+            <key>max</key><real>1.0</real>
+            <key>showValue</key><true/>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSSliderCell</string>
+            <key>label</key><string>大小</string>
+            <key>key</key><string>floatButtonSize</string>
+            <key>defaults</key><string>com.catpaw.statusback</string>
+            <key>default</key><real>48</real>
+            <key>min</key><real>32</real>
+            <key>max</key><real>96</real>
+            <key>showValue</key><true/>
+        </dict>
+
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>返回行为</string>
         </dict>
         <dict>
             <key>cell</key><string>PSSegmentCell</string>
