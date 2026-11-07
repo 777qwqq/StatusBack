@@ -29,30 +29,8 @@ static void sbk_statusback_HandlePreferencesChanged(CFNotificationCenterRef cent
                                                    const void *object, CFDictionaryRef info);
 
 static const void * const kSBKStatusbackButtonKey = &kSBKStatusbackButtonKey;
-static NSString * const kSBKStatusbackWindowKey = @"SBKStatusbackButtonWindow";
 
 #pragma mark - Shared helpers
-
-// The app's key window, excluding the button overlay. The overlay is made key
-// so it receives touches, which would otherwise shadow the app window.
-static UIWindow * sbk_statusback_AppKeyWindow(void) {
-    UIApplication *app = [UIApplication sharedApplication];
-    if (!app) return nil;
-
-    UIWindow *fallback = nil;
-    for (UIScene *scene in app.connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        UIWindowScene *windowScene = (UIWindowScene *)scene;
-        for (UIWindow *window in windowScene.windows) {
-            if ([window isKindOfClass:NSClassFromString(@"SBKStatusbackButtonWindow")]) continue;
-            if (window.isKeyWindow) return window;
-            if (!fallback && window.windowLevel == UIWindowLevelNormal && !window.hidden) {
-                fallback = window;
-            }
-        }
-    }
-    return fallback;
-}
 
 static void sbk_statusback_PostHome(void) {
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
@@ -237,11 +215,16 @@ static UIWindowScene * sbk_statusback_HostScene(void) {
 
 @end
 
+// One overlay per process. A per-scene registry allowed a second overlay to
+// be created when the scene enumeration order changed between calls, which
+// showed up as two buttons in apps that own several scenes.
+static UIWindow *sbk_statusback_gButtonWindow = nil;
+
 static UIWindow * sbk_statusback_ButtonWindow(void) {
-    UIWindowScene *scene = sbk_statusback_HostScene();
-    if (!scene) return nil;
-    UIWindow *window = objc_getAssociatedObject(scene, (__bridge const void *)kSBKStatusbackWindowKey);
-    if ([window isKindOfClass:[UIWindow class]] && !window.hidden) return window;
+    if ([sbk_statusback_gButtonWindow isKindOfClass:[UIWindow class]] &&
+        !sbk_statusback_gButtonWindow.hidden) {
+        return sbk_statusback_gButtonWindow;
+    }
     return nil;
 }
 
@@ -295,28 +278,21 @@ static void sbk_statusback_ShowButton(void) {
     [window makeKeyAndVisible];
     window.hidden = NO;
 
-    objc_setAssociatedObject(scene, (__bridge const void *)kSBKStatusbackWindowKey, window,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    sbk_statusback_gButtonWindow = window;
 }
 
 // Tears the overlay down instead of only hiding it. A hidden UIWindow stays in
 // the window list and keeps its windowLevel; leaving it there means a later
 // scene can end up with a second overlay on top of the first.
 static void sbk_statusback_HideButton(void) {
-    UIApplication *app = [UIApplication sharedApplication];
-    if (!app) return;
+    UIWindow *window = sbk_statusback_gButtonWindow;
+    sbk_statusback_gButtonWindow = nil;
+    if (![window isKindOfClass:[UIWindow class]]) return;
 
-    for (UIScene *scene in app.connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        UIWindow *window = objc_getAssociatedObject(scene, (__bridge const void *)kSBKStatusbackWindowKey);
-        if ([window isKindOfClass:[UIWindow class]]) {
-            window.hidden = YES;
-            window.rootViewController = nil;
-            [window.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
-            [window removeFromSuperview];
-            objc_setAssociatedObject(scene, (__bridge const void *)kSBKStatusbackWindowKey, nil,
-                                     OBJC_ASSOCIATION_ASSIGN);
-        }
+    window.hidden = YES;
+    window.rootViewController = nil;
+    for (UIView *subview in [window.subviews copy]) {
+        [subview removeFromSuperview];
     }
 }
 
@@ -372,22 +348,60 @@ static BOOL sbk_statusback_PresentsButtonOverlay(UIViewController *controller) {
     return NO;
 }
 
-// The view controller a back step should act on: the frontmost presented
-// controller, otherwise the app window's root.
-static UIViewController * sbk_statusback_TargetViewController(void) {
-    UIWindow *window = sbk_statusback_AppKeyWindow();
-    if (!window) return nil;
-
-    UIViewController *controller = window.rootViewController;
-    while (controller) {
+// Walks the presented chain from a root, returning every controller that
+// could be a back-step target. Controllers already in the skip set are
+// omitted, and a presented controller that owns the button overlay is treated
+// as the end of the chain.
+static NSArray<UIViewController *> * sbk_statusback_SceneCandidates(UIViewController *root,
+                                                                   NSMutableSet<UIViewController *> *seen) {
+    NSMutableArray<UIViewController *> *result = [NSMutableArray array];
+    UIViewController *controller = root;
+    while (controller && ![seen containsObject:controller]) {
+        [seen addObject:controller];
+        [result addObject:controller];
         UIViewController *presented = controller.presentedViewController;
         if (!presented) break;
-        // A presented overlay window is ours, not the app's — skip it and keep
-        // walking the app's own chain.
         if (sbk_statusback_PresentsButtonOverlay(presented)) break;
         controller = presented;
     }
-    return controller;
+    return result;
+}
+
+// The view controller a back step should act on. Rather than trusting
+// keyWindow — which the overlay itself becomes, and which several apps share
+// across windows — collect the candidate roots from every app window and pick
+// the one that can actually perform a back step.
+static UIViewController * sbk_statusback_TargetViewController(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return nil;
+
+    NSMutableSet<UIViewController *> *seen = [NSMutableSet set];
+
+    // Prefer normal-level, visible windows: that is where app content lives.
+    for (UIScene *scene in app.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *window in [(UIWindowScene *)scene windows]) {
+            if ([window isKindOfClass:NSClassFromString(@"SBKStatusbackButtonWindow")]) continue;
+            if (window.hidden) continue;
+            if (window.windowLevel != UIWindowLevelNormal) continue;
+            NSArray<UIViewController *> *candidates =
+                sbk_statusback_SceneCandidates(window.rootViewController, seen);
+            if (candidates.count > 0) return candidates.firstObject;
+        }
+    }
+
+    // Fall back to any remaining visible window, including non-normal levels.
+    for (UIScene *scene in app.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *window in [(UIWindowScene *)scene windows]) {
+            if ([window isKindOfClass:NSClassFromString(@"SBKStatusbackButtonWindow")]) continue;
+            if (window.hidden) continue;
+            NSArray<UIViewController *> *candidates =
+                sbk_statusback_SceneCandidates(window.rootViewController, seen);
+            if (candidates.count > 0) return candidates.firstObject;
+        }
+    }
+    return nil;
 }
 
 static BOOL sbk_statusback_PerformBackOnViewController(UIViewController *controller) {
@@ -437,6 +451,27 @@ static BOOL sbk_statusback_PerformBackOnViewController(UIViewController *control
         NULL, (CFNotificationCallback)sbk_statusback_HandleHomeNotification,
         (__bridge CFStringRef)SBKStatusbackHomeNotification, NULL,
         CFNotificationSuspensionBehaviorDeliverImmediately);
+}
+
+%end
+
+// Records the navigation controllers actually used by the app. Several apps
+// (WeChat, QQ among them) keep their stack in a controller that is not
+// reachable from any window's rootViewController, so window-walking alone
+// finds nothing to pop.
+static NSMutableSet<UINavigationController *> *sbk_statusback_gNavigationControllers = nil;
+
+%hook UINavigationController
+
+- (instancetype)initWithRootViewController:(UIViewController *)rootViewController {
+    UINavigationController *result = %orig;
+    if (result) {
+        if (!sbk_statusback_gNavigationControllers) {
+            sbk_statusback_gNavigationControllers = [NSMutableSet set];
+        }
+        [sbk_statusback_gNavigationControllers addObject:result];
+    }
+    return result;
 }
 
 %end
@@ -494,6 +529,40 @@ static void sbk_statusback_HandleTriggerCallback(CFNotificationCenterRef center,
             return;
         }
         if (sbk_statusback_PerformBackOnViewController(controller)) return;
+
+        // The first candidate may be a container with nothing to pop while a
+        // deeper window or presented controller does. Walk the whole candidate
+        // list before giving up and going home.
+        UIApplication *app = [UIApplication sharedApplication];
+        NSMutableSet<UIViewController *> *seen = [NSMutableSet set];
+        for (UIScene *scene in app.connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *window in [(UIWindowScene *)scene windows]) {
+                if ([window isKindOfClass:NSClassFromString(@"SBKStatusbackButtonWindow")]) continue;
+                if (window.hidden) continue;
+                for (UIViewController *candidate in sbk_statusback_SceneCandidates(window.rootViewController, seen)) {
+                    if (sbk_statusback_PerformBackOnViewController(candidate)) return;
+                }
+            }
+        }
+
+        // Last resort: navigation controllers the app created but did not
+        // attach to any window's root chain. Prefer the one whose top
+        // controller is still on screen.
+        for (UINavigationController *nav in [sbk_statusback_gNavigationControllers copy]) {
+            if (nav.viewControllers.count <= 1) continue;
+            UIViewController *top = nav.topViewController;
+            if (top && [top isViewLoaded] && top.view.window) {
+                [nav popViewControllerAnimated:YES];
+                return;
+            }
+        }
+        for (UINavigationController *nav in [sbk_statusback_gNavigationControllers copy]) {
+            if (nav.viewControllers.count <= 1) continue;
+            [nav popViewControllerAnimated:YES];
+            return;
+        }
+
         if ([config sbk_statusback_fallbackBehavior] == SBKStatusbackFallbackBehaviorHome) sbk_statusback_PostHome();
     });
 }
