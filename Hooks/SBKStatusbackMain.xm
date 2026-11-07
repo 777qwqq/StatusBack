@@ -6,9 +6,12 @@
 // from its own stack). When nothing is left to pop, the tweak asks
 // SpringBoard to go home.
 //
-// The status bar strip is a plain UIKit overlay installed by this tweak, so
-// it cannot be confused with a control drawn by the host app. It only claims
-// touches that land inside the status bar rectangle and hit nothing else.
+// The trigger is implemented by filtering UIApplication's sendEvent:. The
+// system status bar lives in its own window above the app's window, so an
+// overlay added to the app window can never receive status bar touches —
+// but every touch in the app, status bar included, flows through
+// sendEvent:. The hit test uses the real status bar frame instead of a
+// hard-coded height, so notch and Dynamic Island devices work too.
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -54,43 +57,6 @@ static void sbk_statusback_PostTrigger(void) {
         (__bridge CFStringRef)SBKStatusbackTriggerNotification, NULL, NULL, true);
 }
 
-#pragma mark - Status bar overlay
-
-@interface SBKStatusbackStatusBarTapView : UIView
-@end
-
-@implementation SBKStatusbackStatusBarTapView
-
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    // Only claim taps in the top strip; everything else falls through.
-    if (point.y > 44.0) return nil;
-    return [super hitTest:point withEvent:event];
-}
-
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    SBKStatusbackConfig *config = [SBKStatusbackConfig sbk_statusback_shared];
-    if (![config sbk_statusback_isEnabled]) return;
-
-    SBKStatusbackTriggerSide side = [config sbk_statusback_triggerSide];
-    if (side == SBKStatusbackTriggerSideNone) return;
-
-    CGFloat width = self.bounds.size.width;
-    if (width <= 0) return;
-
-    UITouch *touch = [touches anyObject];
-    CGPoint point = [touch locationInView:self];
-    BOOL isLeft = point.x < width / 2.0;
-
-    if ((side == SBKStatusbackTriggerSideLeft && !isLeft) || (side == SBKStatusbackTriggerSideRight && isLeft)) {
-        return;
-    }
-
-    sbk_statusback_PostTrigger();
-    [super touchesBegan:touches withEvent:event];
-}
-
-@end
-
 static BOOL sbk_statusback_IsSpringBoard(void) {
     static BOOL isSpringBoard;
     static dispatch_once_t onceToken;
@@ -100,24 +66,40 @@ static BOOL sbk_statusback_IsSpringBoard(void) {
     return isSpringBoard;
 }
 
-static void sbk_statusback_InstallStatusBarOverlay(void) {
-    if (![[SBKStatusbackConfig sbk_statusback_shared] sbk_statusback_isEnabled]) return;
-    // SpringBoard only needs to handle the home notification; putting a tap
-    // overlay on its status bar would swallow system gestures.
-    if (sbk_statusback_IsSpringBoard()) return;
-    UIWindow *window = sbk_statusback_KeyWindow();
-    if (!window) return;
+// Returns YES when the touch lands inside the status bar and the configured
+// side matches.
+static BOOL sbk_statusback_ShouldTriggerForTouches(NSSet<UITouch *> *touches) {
+    SBKStatusbackConfig *config = [SBKStatusbackConfig sbk_statusback_shared];
+    if (![config sbk_statusback_isEnabled]) return NO;
 
-    static NSString * const kOverlayKey = @"SBKStatusbackStatusBarTapView";
-    if (objc_getAssociatedObject(window, (__bridge const void *)kOverlayKey)) return;
+    SBKStatusbackTriggerSide side = [config sbk_statusback_triggerSide];
+    if (side == SBKStatusbackTriggerSideNone) return NO;
 
-    SBKStatusbackStatusBarTapView *overlay = [[SBKStatusbackStatusBarTapView alloc] initWithFrame:window.bounds];
-    overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    overlay.backgroundColor = [UIColor clearColor];
-    overlay.userInteractionEnabled = YES;
-    [window addSubview:overlay];
-    objc_setAssociatedObject(window, (__bridge const void *)kOverlayKey, overlay,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (sbk_statusback_IsSpringBoard()) return NO;
+
+    UITouch *touch = [touches anyObject];
+    if (!touch) return NO;
+
+    // locationInWindow gives coordinates in the touch's own window, which for
+    // status bar touches is the status bar window — its origin is the screen
+    // origin, so the y value is directly comparable to statusBarFrame.
+    UIWindow *touchWindow = touch.window;
+    if (!touchWindow) return NO;
+
+    UIWindowScene *scene = (UIWindowScene *)touchWindow.windowScene;
+    if (!scene || !scene.statusBarManager) return NO;
+    CGRect statusBarFrame = scene.statusBarManager.statusBarFrame;
+    if (CGRectIsEmpty(statusBarFrame)) return NO;
+
+    CGPoint point = [touch locationInView:touchWindow];
+    if (!CGRectContainsPoint(statusBarFrame, point)) return NO;
+
+    // Only the left or right half, per the preference.
+    BOOL isLeft = point.x < statusBarFrame.size.width / 2.0;
+    if (side == SBKStatusbackTriggerSideLeft && !isLeft) return NO;
+    if (side == SBKStatusbackTriggerSideRight && isLeft) return NO;
+
+    return YES;
 }
 
 #pragma mark - Back action
@@ -171,11 +153,24 @@ static BOOL sbk_statusback_PerformBackOnViewController(UIViewController *control
 
 %end
 
-%hook UIWindow
+%hook UIApplication
 
-- (void)makeKeyAndVisible {
+- (void)sendEvent:(UIEvent *)event {
     %orig;
-    sbk_statusback_InstallStatusBarOverlay();
+
+    if (event.type != UIEventTypeTouches) return;
+    NSSet<UITouch *> *touches = event.allTouches;
+    if (touches.count == 0) return;
+
+    // Only react to the end of a single tap, and only when the touch began
+    // inside the status bar (so dragging out of the status bar does not fire).
+    UITouch *touch = [touches anyObject];
+    if (touch.phase != UITouchPhaseEnded) return;
+    if (touches.count != 1) return;
+
+    if (sbk_statusback_ShouldTriggerForTouches(touches)) {
+        sbk_statusback_PostTrigger();
+    }
 }
 
 %end
