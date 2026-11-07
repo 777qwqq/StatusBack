@@ -71,17 +71,29 @@ static BOOL sbk_statusback_IsSpringBoard(void) {
     return isSpringBoard;
 }
 
-// The scene that should host the floating button: the foreground active
-// window scene, or nil when the app is in the background.
+// The scene that should host the floating button.
+//
+// During launch the scene can still be foregroundInactive even though the
+// app is about to become active, so a scene that is merely connected is
+// accepted as a last resort. Without that fallback the button never appears
+// in apps that were cold-launched.
 static UIWindowScene * sbk_statusback_HostScene(void) {
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return nil;
+
+    UIWindowScene *fallback = nil;
     for (UIScene *scene in app.connectedScenes) {
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
         if (scene.activationState == UISceneActivationStateForegroundActive) {
-            return (UIWindowScene *)scene;
+            return windowScene;
+        }
+        if (scene.activationState == UISceneActivationStateForegroundInactive && !fallback) {
+            fallback = windowScene;
         }
     }
+    if (fallback) return fallback;
+
     for (UIScene *scene in app.connectedScenes) {
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
         if (scene.activationState != UISceneActivationStateBackground) {
@@ -160,9 +172,20 @@ static UIWindowScene * sbk_statusback_HostScene(void) {
     sbk_statusback_PostTrigger();
 }
 
+// The button's superview is the root view controller's view, not the window.
+// Walk up to the real window for coordinate conversion and bounds checks.
+- (UIWindow *)sbk_statusback_hostWindow {
+    UIResponder *responder = self.nextResponder;
+    while (responder) {
+        if ([responder isKindOfClass:[UIWindow class]]) return (UIWindow *)responder;
+        responder = responder.nextResponder;
+    }
+    return nil;
+}
+
 - (void)sbk_statusback_handlePan:(UIPanGestureRecognizer *)gesture {
-    UIWindow *window = (UIWindow *)self.superview;
-    if (![window isKindOfClass:[UIWindow class]]) return;
+    UIWindow *window = [self sbk_statusback_hostWindow];
+    if (!window) return;
 
     switch (gesture.state) {
         case UIGestureRecognizerStateBegan: {
@@ -197,7 +220,7 @@ static UIWindowScene * sbk_statusback_HostScene(void) {
 }
 
 - (void)sbk_statusback_clampToScreen {
-    UIWindow *window = (UIWindow *)self.superview;
+    UIWindow *window = [self sbk_statusback_hostWindow];
     if (!window) return;
     CGRect bounds = window.bounds;
     if (bounds.size.width <= 0 || bounds.size.height <= 0) return;
@@ -368,24 +391,10 @@ static BOOL sbk_statusback_PerformBackOnViewController(UIViewController *control
 
 %end
 
-%hook UIApplication
-
-- (void)applicationDidBecomeActive:(UIApplication *)application {
-    %orig;
-    dispatch_async(dispatch_get_main_queue(), ^{ sbk_statusback_RefreshButton(); });
-}
-
-- (void)applicationWillResignActive:(UIApplication *)application {
-    %orig;
-    dispatch_async(dispatch_get_main_queue(), ^{ sbk_statusback_HideButton(); });
-}
-
-- (void)applicationDidEnterBackground:(UIApplication *)application {
-    %orig;
-    dispatch_async(dispatch_get_main_queue(), ^{ sbk_statusback_HideButton(); });
-}
-
-%end
+// The foreground/background transitions are observed through notifications.
+// Hooking UIApplication's applicationDidBecomeActive: does nothing: that
+// selector belongs to UIApplicationDelegate and is never implemented by
+// UIApplication itself, so the hook never fires.
 
 static void sbk_statusback_HandleHomeNotification(CFNotificationCenterRef center, void *observer,
                                       CFStringRef name, const void *object,
@@ -444,12 +453,32 @@ static void sbk_statusback_HandleTriggerCallback(CFNotificationCenterRef center,
         NULL, (CFNotificationCallback)sbk_statusback_HandleTriggerCallback,
         (__bridge CFStringRef)SBKStatusbackTriggerNotification, NULL,
         CFNotificationSuspensionBehaviorDeliverImmediately);
-    // Rebuild the button whenever preferences change.
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
         NULL, (CFNotificationCallback)sbk_statusback_HandlePreferencesChanged,
         (__bridge CFStringRef)SBKStatusbackPreferencesChanged, NULL,
         CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    // The scene may not be foreground-active yet when the library loads, so
+    // retry a few times after launch instead of giving up on the first miss.
     dispatch_async(dispatch_get_main_queue(), ^{
         sbk_statusback_ShowButton();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ sbk_statusback_ShowButton(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ sbk_statusback_ShowButton(); });
     });
+
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center addObserverForName:UIApplicationDidBecomeActiveNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) { sbk_statusback_RefreshButton(); }];
+    [center addObserverForName:UIApplicationWillResignActiveNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) { sbk_statusback_HideButton(); }];
+    [center addObserverForName:UIApplicationDidEnterBackgroundNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) { sbk_statusback_HideButton(); }];
 }
