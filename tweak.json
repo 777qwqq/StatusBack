@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "name": "StatusBack",
+  "id": "statusback",
+  "display_name": "状态栏返回",
+  "class_prefix": "SBKStatusback",
+  "symbol_prefix": "sbk_statusback",
+  "package": "com.catpaw.statusback",
+  "bundle": "com.apple.springboard",
+  "sdk_version": "16.5",
+  "minimum_ios": "14.0",
+  "preferences": true,
+  "slider": false,
+  "github_actions": true
+}

@@ -1,0 +1,9 @@
+Package: com.catpaw.statusback
+Name: 状态栏返回
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 点击状态栏返回上一级，到根后回主屏幕。
+Maintainer: 777qwqq
+Author: 777qwqq
+Section: Tweaks
+Depends: mobilesubstrate, preferenceloader
