@@ -1,16 +1,13 @@
 // StatusBack — universal "back" for iOS 16 rootless.
 //
 // A draggable floating button is shown over the foreground app. Tapping it
-// posts a Darwin notification; the foreground app performs one back step
-// (accessibility escape -> pop navigation stack -> dismiss modal -> pop self
-// from its own stack). When nothing is left to pop, the tweak asks
-// SpringBoard to go home.
+// posts a Darwin notification; the foreground app performs one back step.
+// When nothing is left to pop, the tweak asks SpringBoard to go home.
 //
-// The button lives in its own UIWindow above every app window, so it is never
-// clipped or covered. Only the foreground app hosts a window at a time: each
-// process creates its own when it becomes active and removes it when it
-// resigns active, which keeps exactly one button on screen without any
-// cross-process window sharing.
+// The back step is applied to the app's real windows, never to the button
+// overlay. The overlay is excluded at two levels: the window lookup skips it
+// by class, and the presented-window search treats a presented overlay as
+// "no presenter" so it cannot shadow the app's own presented view controller.
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -36,20 +33,25 @@ static NSString * const kSBKStatusbackWindowKey = @"SBKStatusbackButtonWindow";
 
 #pragma mark - Shared helpers
 
-static UIWindow * sbk_statusback_KeyWindow(void) {
+// The app's key window, excluding the button overlay. The overlay is made key
+// so it receives touches, which would otherwise shadow the app window.
+static UIWindow * sbk_statusback_AppKeyWindow(void) {
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return nil;
+
+    UIWindow *fallback = nil;
     for (UIScene *scene in app.connectedScenes) {
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
         UIWindowScene *windowScene = (UIWindowScene *)scene;
         for (UIWindow *window in windowScene.windows) {
+            if ([window isKindOfClass:NSClassFromString(@"SBKStatusbackButtonWindow")]) continue;
             if (window.isKeyWindow) return window;
-        }
-        for (UIWindow *window in windowScene.windows) {
-            if (window.windowLevel == UIWindowLevelNormal && !window.hidden) return window;
+            if (!fallback && window.windowLevel == UIWindowLevelNormal && !window.hidden) {
+                fallback = window;
+            }
         }
     }
-    return nil;
+    return fallback;
 }
 
 static void sbk_statusback_PostHome(void) {
@@ -287,6 +289,9 @@ static void sbk_statusback_ShowButton(void) {
     objc_setAssociatedObject(window, kSBKStatusbackButtonKey, button,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
+    // makeKeyAndVisible is required so the window participates in hit testing;
+    // it does not steal touches because hitTest: returns nil outside the
+    // button.
     [window makeKeyAndVisible];
     window.hidden = NO;
 
@@ -294,13 +299,21 @@ static void sbk_statusback_ShowButton(void) {
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+// Tears the overlay down instead of only hiding it. A hidden UIWindow stays in
+// the window list and keeps its windowLevel; leaving it there means a later
+// scene can end up with a second overlay on top of the first.
 static void sbk_statusback_HideButton(void) {
     UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return;
+
     for (UIScene *scene in app.connectedScenes) {
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
         UIWindow *window = objc_getAssociatedObject(scene, (__bridge const void *)kSBKStatusbackWindowKey);
         if ([window isKindOfClass:[UIWindow class]]) {
             window.hidden = YES;
+            window.rootViewController = nil;
+            [window.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
+            [window removeFromSuperview];
             objc_setAssociatedObject(scene, (__bridge const void *)kSBKStatusbackWindowKey, nil,
                                      OBJC_ASSOCIATION_ASSIGN);
         }
@@ -342,6 +355,41 @@ static void sbk_statusback_RefreshButton(void) {
 
 #pragma mark - Back action
 
+// Returns YES when a view controller presented the button overlay. Such a
+// window must not be mistaken for a presented view controller by the search
+// below, otherwise the overlay shadows whatever the app itself presented.
+static BOOL sbk_statusback_PresentsButtonOverlay(UIViewController *controller) {
+    if (!controller) return NO;
+    UIView *view = controller.view;
+    if (!view) return NO;
+    UIResponder *responder = view.nextResponder;
+    while (responder) {
+        if ([responder isKindOfClass:[UIWindow class]]) {
+            return [responder isKindOfClass:NSClassFromString(@"SBKStatusbackButtonWindow")];
+        }
+        responder = responder.nextResponder;
+    }
+    return NO;
+}
+
+// The view controller a back step should act on: the frontmost presented
+// controller, otherwise the app window's root.
+static UIViewController * sbk_statusback_TargetViewController(void) {
+    UIWindow *window = sbk_statusback_AppKeyWindow();
+    if (!window) return nil;
+
+    UIViewController *controller = window.rootViewController;
+    while (controller) {
+        UIViewController *presented = controller.presentedViewController;
+        if (!presented) break;
+        // A presented overlay window is ours, not the app's — skip it and keep
+        // walking the app's own chain.
+        if (sbk_statusback_PresentsButtonOverlay(presented)) break;
+        controller = presented;
+    }
+    return controller;
+}
+
 static BOOL sbk_statusback_PerformBackOnViewController(UIViewController *controller) {
     if (!controller) return NO;
 
@@ -359,8 +407,10 @@ static BOOL sbk_statusback_PerformBackOnViewController(UIViewController *control
         return YES;
     }
 
-    // 3) Dismiss a presented view controller.
-    if (controller.presentedViewController) {
+    // 3) Dismiss a presented view controller. Skip our own overlay, which is
+    //    a window rather than a presented controller.
+    if (controller.presentedViewController &&
+        !sbk_statusback_PresentsButtonOverlay(controller.presentedViewController)) {
         [controller dismissViewControllerAnimated:YES completion:nil];
         return YES;
     }
@@ -421,7 +471,8 @@ static void sbk_statusback_HandleHomeNotification(CFNotificationCenterRef center
 
 static void sbk_statusback_HandlePreferencesChanged(CFNotificationCenterRef center,
                                                     void *observer, CFStringRef name,
-                                                    const void *object, CFDictionaryRef info) {
+                                                    const void *object,
+                                                    CFDictionaryRef info) {
     dispatch_async(dispatch_get_main_queue(), ^{
         sbk_statusback_RefreshButton();
     });
@@ -437,13 +488,12 @@ static void sbk_statusback_HandleTriggerCallback(CFNotificationCenterRef center,
         // handle the fallback instead of walking its view hierarchy.
         if (sbk_statusback_IsSpringBoard()) return;
 
-        UIWindow *window = sbk_statusback_KeyWindow();
-        UIViewController *root = window.rootViewController;
-        if (!root) {
+        UIViewController *controller = sbk_statusback_TargetViewController();
+        if (!controller) {
             if ([config sbk_statusback_fallbackBehavior] == SBKStatusbackFallbackBehaviorHome) sbk_statusback_PostHome();
             return;
         }
-        if (sbk_statusback_PerformBackOnViewController(root)) return;
+        if (sbk_statusback_PerformBackOnViewController(controller)) return;
         if ([config sbk_statusback_fallbackBehavior] == SBKStatusbackFallbackBehaviorHome) sbk_statusback_PostHome();
     });
 }
