@@ -101,14 +101,17 @@ static UIWindowScene * sbk_statusback_HostScene(void) {
 @implementation SBKStatusbackButtonWindow
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    // Returning nil makes the window transparent to touches, so taps outside
+    // the button fall through to the app underneath. Returning the button
+    // itself is what actually delivers the touch to its gesture recognizers.
     UIView *button = objc_getAssociatedObject(self, kSBKStatusbackButtonKey);
     if (![button isKindOfClass:[UIView class]]) return nil;
     if (button.hidden || button.alpha <= 0.01) return nil;
+    if (!button.userInteractionEnabled) return nil;
+
     CGPoint local = [self convertPoint:point toView:button];
-    UIView *hit = [button hitTest:local withEvent:event];
-    if (!hit) return nil;
-    // Return self so the touch is delivered into this window's hierarchy.
-    return self;
+    if (!CGRectContainsPoint(button.bounds, local)) return nil;
+    return button;
 }
 
 @end
@@ -116,6 +119,7 @@ static UIWindowScene * sbk_statusback_HostScene(void) {
 @interface SBKStatusbackButtonView : UIView
 @property (nonatomic, assign) BOOL dragging;
 @property (nonatomic, assign) CGPoint dragStartCenter;
+@property (nonatomic, assign) NSTimeInterval lastDragEnd;
 @end
 
 @implementation SBKStatusbackButtonView
@@ -150,6 +154,9 @@ static UIWindowScene * sbk_statusback_HostScene(void) {
 }
 
 - (void)sbk_statusback_handleTap:(UIGestureRecognizer *)gesture {
+    // A drag ends with the finger lifting, which can also satisfy the tap
+    // recognizer. Ignore taps that immediately follow a drag.
+    if (self.lastDragEnd > 0 && CACurrentMediaTime() - self.lastDragEnd < 0.35) return;
     sbk_statusback_PostTrigger();
 }
 
@@ -175,6 +182,7 @@ static UIWindowScene * sbk_statusback_HostScene(void) {
         case UIGestureRecognizerStateEnded:
         case UIGestureRecognizerStateCancelled: {
             self.dragging = NO;
+            self.lastDragEnd = CACurrentMediaTime();
             [UIView animateWithDuration:0.15 animations:^{
                 self.transform = CGAffineTransformIdentity;
             }];
@@ -243,7 +251,9 @@ static void sbk_statusback_ShowButton(void) {
     UIViewController *controller = [[UIViewController alloc] init];
     controller.view.frame = bounds;
     controller.view.backgroundColor = [UIColor clearColor];
-    controller.view.userInteractionEnabled = NO;
+    // The container must stay interaction-enabled: disabling it would
+    // recursively disable the button. The window's hitTest: is what makes
+    // everything outside the button pass through.
     window.rootViewController = controller;
 
     SBKStatusbackButtonView *button =
