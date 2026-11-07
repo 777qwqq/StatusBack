@@ -1,13 +1,7 @@
 #pragma once
 
 #import <Foundation/Foundation.h>
-
-typedef NS_ENUM(NSInteger, SBKStatusbackTriggerSide) {
-    SBKStatusbackTriggerSideNone = 0,
-    SBKStatusbackTriggerSideLeft = 1,
-    SBKStatusbackTriggerSideRight = 2,
-    SBKStatusbackTriggerSideBoth = 3,
-};
+#import <CoreGraphics/CoreGraphics.h>
 
 typedef NS_ENUM(NSInteger, SBKStatusbackFallbackBehavior) {
     SBKStatusbackFallbackBehaviorPopOnly = 0,   // never leave the app
@@ -17,8 +11,11 @@ typedef NS_ENUM(NSInteger, SBKStatusbackFallbackBehavior) {
 @interface SBKStatusbackConfig : NSObject
 + (instancetype)sbk_statusback_shared;
 - (BOOL)sbk_statusback_isEnabled;
-- (SBKStatusbackTriggerSide)sbk_statusback_triggerSide;
 - (SBKStatusbackFallbackBehavior)sbk_statusback_fallbackBehavior;
-- (BOOL)sbk_statusback_showStatusIcon;
+- (BOOL)sbk_statusback_showFloatButton;
+- (CGFloat)sbk_statusback_floatButtonAlpha;
+- (CGFloat)sbk_statusback_floatButtonSize;
+- (CGPoint)sbk_statusback_floatButtonPosition;
+- (void)sbk_statusback_setFloatButtonPosition:(CGPoint)position;
 - (void)sbk_statusback_reload;
 @end
