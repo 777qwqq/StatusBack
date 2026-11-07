@@ -93,8 +93,20 @@ static void sbk_statusback_PostTrigger(void) {
 
 @end
 
+static BOOL sbk_statusback_IsSpringBoard(void) {
+    static BOOL isSpringBoard;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        isSpringBoard = [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.springboard"];
+    });
+    return isSpringBoard;
+}
+
 static void sbk_statusback_InstallStatusBarOverlay(void) {
     if (![[SBKStatusbackConfig sbk_statusback_shared] sbk_statusback_isEnabled]) return;
+    // SpringBoard only needs to handle the home notification; putting a tap
+    // overlay on its status bar would swallow system gestures.
+    if (sbk_statusback_IsSpringBoard()) return;
     UIWindow *window = sbk_statusback_KeyWindow();
     if (!window) return;
 
@@ -194,6 +206,9 @@ static void sbk_statusback_HandleTriggerCallback(CFNotificationCenterRef center,
     dispatch_async(dispatch_get_main_queue(), ^{
         SBKStatusbackConfig *config = [SBKStatusbackConfig sbk_statusback_shared];
         if (![config sbk_statusback_isEnabled]) return;
+        // SpringBoard has no app navigation stack; let the home notification
+        // handle the fallback instead of walking its view hierarchy.
+        if (sbk_statusback_IsSpringBoard()) return;
 
         UIWindow *window = sbk_statusback_KeyWindow();
         UIViewController *root = window.rootViewController;
