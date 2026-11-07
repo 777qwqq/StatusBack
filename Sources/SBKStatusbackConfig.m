@@ -22,6 +22,13 @@ static NSInteger sbk_statusback_integerValue(NSDictionary *snapshot, NSString *k
     return fallback;
 }
 
+static CGFloat sbk_statusback_doubleValue(NSDictionary *snapshot, NSString *key, CGFloat fallback) {
+    id value = snapshot[key];
+    if ([value isKindOfClass:[NSNumber class]]) return [value doubleValue];
+    if ([value isKindOfClass:[NSString class]]) return [value doubleValue];
+    return fallback;
+}
+
 @implementation SBKStatusbackConfig
 
 + (instancetype)sbk_statusback_shared {
@@ -62,18 +69,42 @@ static NSInteger sbk_statusback_integerValue(NSDictionary *snapshot, NSString *k
     return NO;
 }
 
-- (SBKStatusbackTriggerSide)sbk_statusback_triggerSide {
-    return (SBKStatusbackTriggerSide)sbk_statusback_integerValue(self.snapshot, @"triggerSide", SBKStatusbackTriggerSideLeft);
-}
-
 - (SBKStatusbackFallbackBehavior)sbk_statusback_fallbackBehavior {
     return (SBKStatusbackFallbackBehavior)sbk_statusback_integerValue(self.snapshot, @"fallbackBehavior", SBKStatusbackFallbackBehaviorHome);
 }
 
-- (BOOL)sbk_statusback_showStatusIcon {
-    id value = self.snapshot[@"showStatusIcon"];
-    if (![value isKindOfClass:[NSNumber class]]) return NO;
+- (BOOL)sbk_statusback_showFloatButton {
+    id value = self.snapshot[@"showFloatButton"];
+    if (![value isKindOfClass:[NSNumber class]]) return YES;
     return [value boolValue];
+}
+
+- (CGFloat)sbk_statusback_floatButtonAlpha {
+    CGFloat alpha = sbk_statusback_doubleValue(self.snapshot, @"floatButtonAlpha", 0.85);
+    return MAX(0.2, MIN(1.0, alpha));
+}
+
+- (CGFloat)sbk_statusback_floatButtonSize {
+    CGFloat size = sbk_statusback_doubleValue(self.snapshot, @"floatButtonSize", 48.0);
+    return MAX(32.0, MIN(96.0, size));
+}
+
+- (CGPoint)sbk_statusback_floatButtonPosition {
+    id x = self.snapshot[@"floatButtonX"];
+    id y = self.snapshot[@"floatButtonY"];
+    if ([x isKindOfClass:[NSNumber class]] && [y isKindOfClass:[NSNumber class]]) {
+        return CGPointMake([x doubleValue], [y doubleValue]);
+    }
+    return CGPointMake(-1.0, -1.0);   // not configured yet
+}
+
+- (void)sbk_statusback_setFloatButtonPosition:(CGPoint)position {
+    if (!isfinite(position.x) || !isfinite(position.y)) return;
+    NSError *error = nil;
+    if (!sbk_statusback_writePreference(@"floatButtonX", @(position.x), &error)) return;
+    if (!sbk_statusback_writePreference(@"floatButtonY", @(position.y), &error)) return;
+    // The snapshot is refreshed by the Darwin notification that the write
+    // triggers; no need to touch the cache here.
 }
 
 - (void)dealloc {
