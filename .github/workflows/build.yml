@@ -1,81 +1,89 @@
-name: build
+name: Build StatusBack
 
 on:
-  push:
-    branches: [ main ]
-    tags: [ 'v*' ]
-  pull_request:
   workflow_dispatch:
-    inputs:
-      version:
-        description: 版本号
-        required: false
-        default: ''
+  push:
+    branches:
+      - main
+      - master
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: write
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+  THEOS: ${{ github.workspace }}/theos
 
 jobs:
   build:
-    name: Build
-    runs-on: macos-latest
-    timeout-minutes: 30
-
+    name: Build rootless
+    runs-on: macos-15
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Version
-        id: version
-        shell: bash
+      - name: Setup Environment
         run: |
-          VERSION="${{ github.event.inputs.version }}"
-          if [ -z "$VERSION" ] && [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "THEOS_IGNORE_PARALLEL_BUILDING_NOTICE=yes" >> $HOME/.theosrc
+
+      - name: Resolve Package Version
+        id: bump
+        run: |
+          VERSION="$(awk '/^Version:/ {print $2}' control | cut -d- -f1)"
+          echo "Using version: $VERSION"
+          echo "package_version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          path: theos
+          submodules: recursive
+
+      - name: Install iOS SDK
+        run: |
+          set -euo pipefail
+          mkdir -p "$THEOS/sdks"
+          if [ -d "$THEOS/sdks/iPhoneOS16.5.sdk" ]; then
+            echo "iPhoneOS16.5.sdk already present"
+            exit 0
           fi
-          if [ -z "$VERSION" ]; then
-            VERSION="1.0.0"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          SDK_STAGE="$(mktemp -d)"
+          trap 'rm -rf "$SDK_STAGE"' EXIT
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$SDK_STAGE/sdks"
+          git -C "$SDK_STAGE/sdks" sparse-checkout set iPhoneOS16.5.sdk
+          cp -R "$SDK_STAGE/sdks/iPhoneOS16.5.sdk" "$THEOS/sdks/"
+          ls -1 "$THEOS/sdks"
 
-      - name: Prepare Theos
-        uses: Randomblock1/theos-action@preview
-
-      - name: Package rootless
-        shell: bash
+      - name: Install Theos dependencies
         run: |
-          set -eu
-          export THEOS_PACKAGE_SCHEME=rootless
-          export PACKAGE_VERSION="${{ steps.version.outputs.version }}"
-          make package FINALPACKAGE=1
-          ls -l packages
+          brew install ldid dpkg xz
 
-      - name: Collect deb
-        shell: bash
+      - name: Build Package
         run: |
-          set -eu
-          mkdir -p dist
-          DEB=$(ls -t packages/*.deb | head -1)
-          cp "$DEB" "dist/com.catpaw.statusback_${{ steps.version.outputs.version }}_iphoneos-arm.deb"
-          ls -l dist
+          sh build.sh rootless
+          echo "=== .deb files ==="
+          find ./packages -name "*.deb" -type f
 
-      - name: Upload deb
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: com.catpaw.statusback_${{ steps.version.outputs.version }}_iphoneos-arm.deb
-          path: dist/com.catpaw.statusback_${{ steps.version.outputs.version }}_iphoneos-arm.deb
+          name: StatusBack-deb
+          path: ./packages/*.deb
           if-no-files-found: error
 
-      - name: Upload release
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -eu
-          gh release create "$GITHUB_REF_NAME" dist/*.deb \
-            --title "$GITHUB_REF_NAME" \
-            --notes "StatusBack ${{ github.ref_name }}"
+      - name: Create Release
+        if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ github.token }}
+          tag_name: v${{ steps.bump.outputs.package_version }}
+          name: 状态栏返回 v${{ steps.bump.outputs.package_version }}
+          overwrite_files: true
+          files: ./packages/*.deb
