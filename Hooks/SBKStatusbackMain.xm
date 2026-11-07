@@ -1,17 +1,16 @@
 // StatusBack — universal "back" for iOS 16 rootless.
 //
-// Tapping the left or right half of the status bar posts a Darwin
-// notification. Every injected process performs exactly one back step
+// A draggable floating button is shown over the foreground app. Tapping it
+// posts a Darwin notification; the foreground app performs one back step
 // (accessibility escape -> pop navigation stack -> dismiss modal -> pop self
 // from its own stack). When nothing is left to pop, the tweak asks
 // SpringBoard to go home.
 //
-// The trigger is implemented by filtering UIApplication's sendEvent:. The
-// system status bar lives in its own window above the app's window, so an
-// overlay added to the app window can never receive status bar touches —
-// but every touch in the app, status bar included, flows through
-// sendEvent:. The hit test uses the real status bar frame instead of a
-// hard-coded height, so notch and Dynamic Island devices work too.
+// The button lives in its own UIWindow above every app window, so it is never
+// clipped or covered. Only the foreground app hosts a window at a time: each
+// process creates its own when it becomes active and removes it when it
+// resigns active, which keeps exactly one button on screen without any
+// cross-process window sharing.
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -28,6 +27,12 @@ static void sbk_statusback_HandleHomeNotification(CFNotificationCenterRef center
 static void sbk_statusback_HandleTriggerCallback(CFNotificationCenterRef center,
                                                 void *observer, CFStringRef name,
                                                 const void *object, CFDictionaryRef info);
+static void sbk_statusback_HandlePreferencesChanged(CFNotificationCenterRef center,
+                                                   void *observer, CFStringRef name,
+                                                   const void *object, CFDictionaryRef info);
+
+static const void * const kSBKStatusbackButtonKey = &kSBKStatusbackButtonKey;
+static NSString * const kSBKStatusbackWindowKey = @"SBKStatusbackButtonWindow";
 
 #pragma mark - Shared helpers
 
@@ -66,40 +71,240 @@ static BOOL sbk_statusback_IsSpringBoard(void) {
     return isSpringBoard;
 }
 
-// Returns YES when the touch lands inside the status bar and the configured
-// side matches.
-static BOOL sbk_statusback_ShouldTriggerForTouches(NSSet<UITouch *> *touches) {
+// The scene that should host the floating button: the foreground active
+// window scene, or nil when the app is in the background.
+static UIWindowScene * sbk_statusback_HostScene(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return nil;
+    for (UIScene *scene in app.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        if (scene.activationState == UISceneActivationStateForegroundActive) {
+            return (UIWindowScene *)scene;
+        }
+    }
+    for (UIScene *scene in app.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        if (scene.activationState != UISceneActivationStateBackground) {
+            return (UIWindowScene *)scene;
+        }
+    }
+    return nil;
+}
+
+#pragma mark - Floating button
+
+// A window that only forwards touches landing on the button; everything else
+// passes through to the app underneath.
+@interface SBKStatusbackButtonWindow : UIWindow
+@end
+
+@implementation SBKStatusbackButtonWindow
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *button = objc_getAssociatedObject(self, kSBKStatusbackButtonKey);
+    if (![button isKindOfClass:[UIView class]]) return nil;
+    if (button.hidden || button.alpha <= 0.01) return nil;
+    CGPoint local = [self convertPoint:point toView:button];
+    UIView *hit = [button hitTest:local withEvent:event];
+    if (!hit) return nil;
+    // Return self so the touch is delivered into this window's hierarchy.
+    return self;
+}
+
+@end
+
+@interface SBKStatusbackButtonView : UIView
+@property (nonatomic, assign) BOOL dragging;
+@property (nonatomic, assign) CGPoint dragStartCenter;
+@end
+
+@implementation SBKStatusbackButtonView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+        self.layer.cornerRadius = frame.size.width / 2.0;
+        self.layer.masksToBounds = YES;
+
+        UILabel *glyph = [[UILabel alloc] initWithFrame:self.bounds];
+        glyph.text = @"‹";
+        glyph.font = [UIFont boldSystemFontOfSize:frame.size.width * 0.55];
+        glyph.textColor = [UIColor whiteColor];
+        glyph.textAlignment = NSTextAlignmentCenter;
+        glyph.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [self addSubview:glyph];
+
+        UIPanGestureRecognizer *pan =
+            [[UIPanGestureRecognizer alloc] initWithTarget:self
+                                                    action:@selector(sbk_statusback_handlePan:)];
+        [self addGestureRecognizer:pan];
+
+        UITapGestureRecognizer *tap =
+            [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                    action:@selector(sbk_statusback_handleTap:)];
+        tap.numberOfTapsRequired = 1;
+        [self addGestureRecognizer:tap];
+    }
+    return self;
+}
+
+- (void)sbk_statusback_handleTap:(UIGestureRecognizer *)gesture {
+    sbk_statusback_PostTrigger();
+}
+
+- (void)sbk_statusback_handlePan:(UIPanGestureRecognizer *)gesture {
+    UIWindow *window = (UIWindow *)self.superview;
+    if (![window isKindOfClass:[UIWindow class]]) return;
+
+    switch (gesture.state) {
+        case UIGestureRecognizerStateBegan: {
+            self.dragging = YES;
+            self.dragStartCenter = self.center;
+            [UIView animateWithDuration:0.1 animations:^{
+                self.transform = CGAffineTransformMakeScale(1.15, 1.15);
+            }];
+            break;
+        }
+        case UIGestureRecognizerStateChanged: {
+            CGPoint translation = [gesture translationInView:window];
+            self.center = CGPointMake(self.dragStartCenter.x + translation.x,
+                                      self.dragStartCenter.y + translation.y);
+            break;
+        }
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled: {
+            self.dragging = NO;
+            [UIView animateWithDuration:0.15 animations:^{
+                self.transform = CGAffineTransformIdentity;
+            }];
+            [self sbk_statusback_clampToScreen];
+            [[SBKStatusbackConfig sbk_statusback_shared]
+                sbk_statusback_setFloatButtonPosition:self.frame.origin];
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+- (void)sbk_statusback_clampToScreen {
+    UIWindow *window = (UIWindow *)self.superview;
+    if (!window) return;
+    CGRect bounds = window.bounds;
+    if (bounds.size.width <= 0 || bounds.size.height <= 0) return;
+
+    CGFloat width = self.bounds.size.width;
+    CGFloat height = self.bounds.size.height;
+    CGPoint center = self.center;
+    center.x = MAX(width / 2.0, MIN(bounds.size.width - width / 2.0, center.x));
+    center.y = MAX(height / 2.0, MIN(bounds.size.height - height / 2.0, center.y));
+    self.center = center;
+}
+
+@end
+
+static UIWindow * sbk_statusback_ButtonWindow(void) {
+    UIWindowScene *scene = sbk_statusback_HostScene();
+    if (!scene) return nil;
+    UIWindow *window = objc_getAssociatedObject(scene, (__bridge const void *)kSBKStatusbackWindowKey);
+    if ([window isKindOfClass:[UIWindow class]] && !window.hidden) return window;
+    return nil;
+}
+
+static void sbk_statusback_ShowButton(void) {
     SBKStatusbackConfig *config = [SBKStatusbackConfig sbk_statusback_shared];
-    if (![config sbk_statusback_isEnabled]) return NO;
+    if (![config sbk_statusback_isEnabled]) return;
+    if (![config sbk_statusback_showFloatButton]) return;
+    if (sbk_statusback_ButtonWindow()) return;
 
-    SBKStatusbackTriggerSide side = [config sbk_statusback_triggerSide];
-    if (side == SBKStatusbackTriggerSideNone) return NO;
+    UIWindowScene *scene = sbk_statusback_HostScene();
+    if (!scene) return;
 
-    if (sbk_statusback_IsSpringBoard()) return NO;
+    CGRect bounds = scene.coordinateSpace.bounds;
+    if (bounds.size.width <= 0 || bounds.size.height <= 0) return;
 
-    UITouch *touch = [touches anyObject];
-    if (!touch) return NO;
+    CGFloat size = [config sbk_statusback_floatButtonSize];
+    CGPoint stored = [config sbk_statusback_floatButtonPosition];
+    if (stored.x < 0 || stored.y < 0) {
+        // Default: right edge, a third of the way down.
+        stored = CGPointMake(bounds.size.width - size - 12.0, bounds.size.height * 0.35);
+    }
+    stored.x = MAX(size / 2.0, MIN(bounds.size.width - size / 2.0, stored.x));
+    stored.y = MAX(size / 2.0, MIN(bounds.size.height - size / 2.0, stored.y));
 
-    // locationInWindow gives coordinates in the touch's own window, which for
-    // status bar touches is the status bar window — its origin is the screen
-    // origin, so the y value is directly comparable to statusBarFrame.
-    UIWindow *touchWindow = touch.window;
-    if (!touchWindow) return NO;
+    SBKStatusbackButtonWindow *window =
+        [[SBKStatusbackButtonWindow alloc] initWithWindowScene:scene];
+    window.windowLevel = UIWindowLevelAlert + 10;
+    window.backgroundColor = [UIColor clearColor];
+    window.opaque = NO;
+    window.frame = bounds;
 
-    UIWindowScene *scene = (UIWindowScene *)touchWindow.windowScene;
-    if (!scene || !scene.statusBarManager) return NO;
-    CGRect statusBarFrame = scene.statusBarManager.statusBarFrame;
-    if (CGRectIsEmpty(statusBarFrame)) return NO;
+    UIViewController *controller = [[UIViewController alloc] init];
+    controller.view.frame = bounds;
+    controller.view.backgroundColor = [UIColor clearColor];
+    controller.view.userInteractionEnabled = NO;
+    window.rootViewController = controller;
 
-    CGPoint point = [touch locationInView:touchWindow];
-    if (!CGRectContainsPoint(statusBarFrame, point)) return NO;
+    SBKStatusbackButtonView *button =
+        [[SBKStatusbackButtonView alloc] initWithFrame:CGRectMake(0, 0, size, size)];
+    button.center = stored;
+    button.alpha = [config sbk_statusback_floatButtonAlpha];
+    [controller.view addSubview:button];
+    objc_setAssociatedObject(window, kSBKStatusbackButtonKey, button,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // Only the left or right half, per the preference.
-    BOOL isLeft = point.x < statusBarFrame.size.width / 2.0;
-    if (side == SBKStatusbackTriggerSideLeft && !isLeft) return NO;
-    if (side == SBKStatusbackTriggerSideRight && isLeft) return NO;
+    [window makeKeyAndVisible];
+    window.hidden = NO;
 
-    return YES;
+    objc_setAssociatedObject(scene, (__bridge const void *)kSBKStatusbackWindowKey, window,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void sbk_statusback_HideButton(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    for (UIScene *scene in app.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindow *window = objc_getAssociatedObject(scene, (__bridge const void *)kSBKStatusbackWindowKey);
+        if ([window isKindOfClass:[UIWindow class]]) {
+            window.hidden = YES;
+            objc_setAssociatedObject(scene, (__bridge const void *)kSBKStatusbackWindowKey, nil,
+                                     OBJC_ASSOCIATION_ASSIGN);
+        }
+    }
+}
+
+static void sbk_statusback_RelayoutButton(void) {
+    UIWindow *window = sbk_statusback_ButtonWindow();
+    if (!window) return;
+    UIView *button = objc_getAssociatedObject(window, kSBKStatusbackButtonKey);
+    if (![button isKindOfClass:[UIView class]]) return;
+
+    SBKStatusbackConfig *config = [SBKStatusbackConfig sbk_statusback_shared];
+    button.alpha = [config sbk_statusback_floatButtonAlpha];
+    CGFloat size = [config sbk_statusback_floatButtonSize];
+    button.bounds = CGRectMake(0, 0, size, size);
+    button.layer.cornerRadius = size / 2.0;
+    for (UIView *subview in button.subviews) {
+        if ([subview isKindOfClass:[UILabel class]]) {
+            ((UILabel *)subview).font = [UIFont boldSystemFontOfSize:size * 0.55];
+        }
+    }
+}
+
+static void sbk_statusback_RefreshButton(void) {
+    SBKStatusbackConfig *config = [SBKStatusbackConfig sbk_statusback_shared];
+    BOOL wanted = [config sbk_statusback_isEnabled] && [config sbk_statusback_showFloatButton];
+    UIWindow *existing = sbk_statusback_ButtonWindow();
+    if (!wanted) {
+        if (existing) sbk_statusback_HideButton();
+        return;
+    }
+    if (existing) {
+        sbk_statusback_RelayoutButton();
+    } else {
+        sbk_statusback_ShowButton();
+    }
 }
 
 #pragma mark - Back action
@@ -155,22 +360,19 @@ static BOOL sbk_statusback_PerformBackOnViewController(UIViewController *control
 
 %hook UIApplication
 
-- (void)sendEvent:(UIEvent *)event {
+- (void)applicationDidBecomeActive:(UIApplication *)application {
     %orig;
+    dispatch_async(dispatch_get_main_queue(), ^{ sbk_statusback_RefreshButton(); });
+}
 
-    if (event.type != UIEventTypeTouches) return;
-    NSSet<UITouch *> *touches = event.allTouches;
-    if (touches.count == 0) return;
+- (void)applicationWillResignActive:(UIApplication *)application {
+    %orig;
+    dispatch_async(dispatch_get_main_queue(), ^{ sbk_statusback_HideButton(); });
+}
 
-    // Only react to the end of a single tap, and only when the touch began
-    // inside the status bar (so dragging out of the status bar does not fire).
-    UITouch *touch = [touches anyObject];
-    if (touch.phase != UITouchPhaseEnded) return;
-    if (touches.count != 1) return;
-
-    if (sbk_statusback_ShouldTriggerForTouches(touches)) {
-        sbk_statusback_PostTrigger();
-    }
+- (void)applicationDidEnterBackground:(UIApplication *)application {
+    %orig;
+    dispatch_async(dispatch_get_main_queue(), ^{ sbk_statusback_HideButton(); });
 }
 
 %end
@@ -195,6 +397,14 @@ static void sbk_statusback_HandleHomeNotification(CFNotificationCenterRef center
     invocation.selector = homeSelector;
     dispatch_async(dispatch_get_main_queue(), ^{
         [invocation invoke];
+    });
+}
+
+static void sbk_statusback_HandlePreferencesChanged(CFNotificationCenterRef center,
+                                                    void *observer, CFStringRef name,
+                                                    const void *object, CFDictionaryRef info) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        sbk_statusback_RefreshButton();
     });
 }
 
@@ -224,4 +434,12 @@ static void sbk_statusback_HandleTriggerCallback(CFNotificationCenterRef center,
         NULL, (CFNotificationCallback)sbk_statusback_HandleTriggerCallback,
         (__bridge CFStringRef)SBKStatusbackTriggerNotification, NULL,
         CFNotificationSuspensionBehaviorDeliverImmediately);
+    // Rebuild the button whenever preferences change.
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+        NULL, (CFNotificationCallback)sbk_statusback_HandlePreferencesChanged,
+        (__bridge CFStringRef)SBKStatusbackPreferencesChanged, NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        sbk_statusback_ShowButton();
+    });
 }
